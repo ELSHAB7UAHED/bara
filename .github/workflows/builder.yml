@@ -2,9 +2,14 @@ name: 🩸 BARA - Build ESP32 Firmware
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: 
+      - main
+      - master
+      - develop
   pull_request:
-    branches: [ main, master ]
+    branches: 
+      - main
+      - master
   workflow_dispatch:
 
 jobs:
@@ -20,7 +25,7 @@ jobs:
           - esp32-c3
     
     steps:
-      - name: 🔍 Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v3
       
       - name: 🐍 Setup Python
@@ -126,7 +131,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     
     steps:
-      - name: 🔍 Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v3
       
       - name: 📥 Download All Artifacts
@@ -196,7 +201,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: 🔍 Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v3
       
       - name: 🐍 Setup Python
