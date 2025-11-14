@@ -1,1 +1,213 @@
+name: 🩸 BARA - Build ESP32 Firmware
 
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build BARA for ESP32
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        board:
+          - esp32dev
+          - esp32-s2
+          - esp32-c3
+    
+    steps:
+      - name: 🔍 Checkout Repository
+        uses: actions/checkout@v3
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: 📦 Cache PlatformIO
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+      
+      - name: ⚙️ Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+          pio --version
+      
+      - name: 📝 Create platformio.ini
+        run: |
+          cat > platformio.ini << 'EOF'
+          ; ============================================================================
+          ; 🩸 BARA - Advanced WiFi Toolkit for ESP32
+          ; Developed by: Ahmed Nour Ahmed | Qena, Egypt
+          ; ============================================================================
+          
+          [platformio]
+          default_envs = esp32dev
+          
+          [env]
+          framework = arduino
+          monitor_speed = 115200
+          upload_speed = 921600
+          lib_deps = 
+              ESP Async WebServer@^1.2.3
+              AsyncTCP@^1.1.1
+              ArduinoJson@^6.21.3
+          build_flags = 
+              -DCORE_DEBUG_LEVEL=0
+              -DBOARD_HAS_PSRAM
+              -mfix-esp32-psram-cache-issue
+              -Os
+          
+          [env:esp32dev]
+          platform = espressif32@^6.4.0
+          board = esp32dev
+          board_build.mcu = esp32
+          board_build.f_cpu = 240000000L
+          board_build.f_flash = 80000000L
+          board_build.flash_mode = qio
+          board_build.partitions = default.csv
+          
+          [env:esp32-s2]
+          platform = espressif32@^6.4.0
+          board = esp32-s2-saola-1
+          board_build.mcu = esp32s2
+          board_build.f_cpu = 240000000L
+          
+          [env:esp32-c3]
+          platform = espressif32@^6.4.0
+          board = esp32-c3-devkitm-1
+          board_build.mcu = esp32c3
+          board_build.f_cpu = 160000000L
+          EOF
+      
+      - name: 🔧 Prepare Source Files
+        run: |
+          mkdir -p src
+          cp bara.ino src/main.cpp
+      
+      - name: 🔨 Build Firmware for ${{ matrix.board }}
+        run: |
+          pio run -e ${{ matrix.board }}
+      
+      - name: 📊 Display Build Info
+        run: |
+          echo "==================================="
+          echo "🩸 BARA BUILD COMPLETE"
+          echo "==================================="
+          echo "Board: ${{ matrix.board }}"
+          echo "Size Information:"
+          pio run -e ${{ matrix.board }} -t size
+          echo "==================================="
+      
+      - name: 📦 Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bara-${{ matrix.board }}-firmware
+          path: |
+            .pio/build/${{ matrix.board }}/firmware.bin
+            .pio/build/${{ matrix.board }}/firmware.elf
+          retention-days: 30
+  
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: 🔍 Checkout Repository
+        uses: actions/checkout@v3
+      
+      - name: 📥 Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      
+      - name: 📦 Prepare Release Assets
+        run: |
+          mkdir -p release
+          cd artifacts
+          for dir in */; do
+            board_name="${dir%/}"
+            board_name="${board_name#bara-}"
+            board_name="${board_name%-firmware}"
+            cd "$dir"
+            zip -r "../../release/bara-${board_name}.zip" *
+            cd ..
+          done
+          cd ..
+      
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.zip
+          body: |
+            # 🩸 BARA WiFi Toolkit Release
+            
+            **Developed by Ahmed Nour Ahmed | Qena, Egypt**
+            
+            ## 📦 Firmware Files
+            
+            - `bara-esp32dev.zip` - Standard ESP32 boards
+            - `bara-esp32-s2.zip` - ESP32-S2 boards
+            - `bara-esp32-c3.zip` - ESP32-C3 boards
+            
+            ## ⚠️ Legal Notice
+            
+            This tool is for **authorized security testing ONLY**.
+            Unauthorized use is **illegal** and may result in criminal prosecution.
+            
+            ## 🔧 Installation
+            
+            1. Download the appropriate firmware for your board
+            2. Use esptool.py or Arduino IDE to flash
+            3. Connect to WiFi: `BARA_HACKING_PORTAL`
+            4. Password: `A7med@Elshab7`
+            5. Navigate to: `http://192.168.4.1`
+            
+            ## 📚 Features
+            
+            - Multi-target deauth attacks
+            - Live network scanning
+            - Captive portal interface
+            - Real-time packet statistics
+            - Epic blood-hacker UI with Matrix effects
+            - Audio/visual feedback
+            
+            ---
+            
+            🩸 **Use responsibly and legally!** 🩸
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🔍 Checkout Repository
+        uses: actions/checkout@v3
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: ⚙️ Install Tools
+        run: |
+          pip install platformio
+      
+      - name: 🔍 Check Code
+        run: |
+          pio check --skip-packages
